@@ -2,11 +2,40 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: TA2 - Event Driven Serverless File Processing Architecture
 
 Parameters:
+
   EmailAddress:
     Type: String
     Description: Email for SNS subscription
 
 Resources:
+
+############################################
+# S3 Bucket
+############################################
+
+  FileBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaPermission
+    Properties:
+      BucketName: ta2-file-upload-bucket-demo
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FileProcessorLambda.Arn
+
+############################################
+# SNS
+############################################
+
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -19,19 +48,200 @@ Resources:
       Protocol: email
       Endpoint: !Ref EmailAddress
 
+############################################
+# IAM Role
+############################################
+
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
+
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
-              Service: [lambda.amazonaws.com]
-            Action: sts:AssumeRole
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
 
+      Policies:
+
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: "*"
+
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: "*"
+
+############################################
+# VPC
+############################################
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+############################################
+# Public Subnet
+############################################
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+
+############################################
+# Private Subnet
+############################################
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+
+############################################
+# Elastic IP
+############################################
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+
+############################################
+# NAT Gateway
+############################################
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+############################################
+# Lambda Security Group
+############################################
+
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda SG
+      VpcId: !Ref VPC
+
+############################################
+# Lambda
+############################################
+
+  FileProcessorLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+
+      FunctionName: ProcessS3File
+
+      Runtime: python3.12
+
+      Handler: index.lambda_handler
+
+      Timeout: 30
+
+      Role: !GetAtt LambdaRole.Arn
+
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref PrivateSubnet
+
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopic
+
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+
+              metadata = f"Bucket:{bucket}\nFile:{key}\nStatus:Processed"
+
+              s3.put_object(
+                  Bucket=bucket,
+                  Key="processed-"+key+".txt",
+                  Body=metadata
+              )
+
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Subject="S3 File Processed",
+                  Message=metadata
+              )
+
+              return {
+                  "statusCode":200
+              }
+
+############################################
+# Lambda Permission
+############################################
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FileProcessorLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+
 Outputs:
-  SNSArn:
+
+  Bucket:
+    Value: !Ref FileBucket
+
+  Lambda:
+    Value: !Ref FileProcessorLambda
+
+  SNS:
     Value: !Ref SNSTopic
